@@ -1,19 +1,22 @@
 'use strict';
 
+const https = require('https');
 const nodemailer = require('nodemailer');
 
-// ── Lazy transporter ─────────────────────────────────────────────────────────
-// Initialised on first use so SMTP connection failures during startup don't
-// crash the server. Supports multiple providers:
-//
-//   SENDGRID_API_KEY   → SendGrid (recommended for Render)
-//   SMTP_HOST/...      → custom SMTP  (Gmail, etc.)
-//
 let _transporter = null;
 
 function _getTransporter() {
   if (_transporter) return _transporter;
 
+  // 1) Resend HTTPS API
+  const resendKey = process.env.RESEND_API_KEY;
+  if (resendKey) {
+    console.log('[Mailer] Using Resend HTTPS API');
+    _transporter = { type: 'resend', key: resendKey };
+    return _transporter;
+  }
+
+  // 2) SendGrid SMTP
   const sgKey = process.env.SENDGRID_API_KEY;
   if (sgKey) {
     _transporter = nodemailer.createTransport({
@@ -26,6 +29,7 @@ function _getTransporter() {
     return _transporter;
   }
 
+  // 3) Custom SMTP (Gmail, etc.)
   const smtpHost = process.env.SMTP_HOST;
   if (smtpHost) {
     _transporter = nodemailer.createTransport({
@@ -41,11 +45,10 @@ function _getTransporter() {
     return _transporter;
   }
 
-  console.warn('[Mailer] No email provider configured — emails will not be sent');
+  console.warn('[Mailer] No email provider configured — set RESEND_API_KEY, SENDGRID_API_KEY, or SMTP_HOST');
   return null;
 }
 
-// ── Retry wrapper (3 attempts with exponential backoff) ──────────────────────
 async function _sendWithRetry(mailOptions, retries = 3) {
   let lastErr;
   for (let i = 0; i < retries; i++) {
@@ -55,8 +58,12 @@ async function _sendWithRetry(mailOptions, retries = 3) {
       return;
     }
     try {
-      const info = await t.sendMail(mailOptions);
-      console.log('[Mailer] Sent:', info.messageId);
+      if (t.type === 'resend') {
+        await _sendViaResend(t.key, mailOptions);
+      } else {
+        const info = await t.sendMail(mailOptions);
+        console.log('[Mailer] Sent:', info.messageId);
+      }
       return;
     } catch (err) {
       lastErr = err;
@@ -71,7 +78,42 @@ async function _sendWithRetry(mailOptions, retries = 3) {
   throw lastErr;
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+function _sendViaResend(apiKey, mailOptions) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({
+      from: mailOptions.from,
+      to: mailOptions.to,
+      subject: mailOptions.subject,
+      html: mailOptions.html,
+    });
+    const req = https.request({
+      hostname: 'api.resend.com',
+      path: '/emails',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+      },
+    }, (res) => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          console.log('[Mailer] Resend sent:', body);
+          resolve();
+        } else {
+          const err = new Error(`Resend API error ${res.statusCode}: ${body}`);
+          err.statusCode = res.statusCode;
+          reject(err);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
 
 const sendOtpEmail = async (to, otp, type = 'verify') => {
   const subject =
