@@ -12,6 +12,9 @@ const notificationRoutes = require('./routes/notifications');
 
 const app = express();
 
+// Trust proxy (Render, nginx, etc.) so rate-limiter respects real client IP
+app.set('trust proxy', 1);
+
 // ─── CORS ────────────────────────────────────────────────────────────────────
 // Allow Flutter web (localhost), Android emulator (10.0.2.2), and any origin
 // in development. Tighten this in production.

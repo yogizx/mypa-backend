@@ -3,6 +3,7 @@
 const Meeting = require('../models/Meeting');
 const User    = require('../models/User');
 const { sendMeetingReminderEmail } = require('./mailer');
+const { sendPush } = require('../services/fcm');
 
 const TICK_MS = 60 * 1000;
 let _timer = null;
@@ -13,6 +14,13 @@ const _retryQueue = new Map();
 
 const MAX_RETRIES = 5;
 const RETRY_BASE_MS = 30 * 1000; // 30 s, doubles each attempt
+
+const _labelMap = {
+  onCreate: { label: 'Meeting Created' },
+  at30:     { label: '30 Minutes Until Meeting' },
+  at15:     { label: '15 Minutes Until Meeting' },
+  atStart:  { label: 'Meeting Starting Now' },
+};
 
 async function _sendIfNeeded(meeting, user, type) {
   const prefs = user.notificationPrefs || {};
@@ -25,33 +33,66 @@ async function _sendIfNeeded(meeting, user, type) {
 
   const { pref, flag } = flagMap[type];
 
-  if (prefs.emailReminders === false) return;
   if (prefs[pref] === false) return;
   if (meeting[flag]) return;
 
-  try {
-    await sendMeetingReminderEmail({
-      to:          user.email,
-      userName:    user.fullName,
-      title:       meeting.title,
-      meetingTime: meeting.dateTime,
-      type,
-    });
-    await Meeting.findByIdAndUpdate(meeting._id, {
-      [flag]: true,
-      reminderSent: true,
-    });
-    console.log(`[Reminder] ${type} → ${user.email} for "${meeting.title}"`);
+  const key = `${meeting._id}_${type}`;
+  let anySent = false;
 
-    // Clear from retry queue on success
-    const key = `${meeting._id}_${type}`;
+  // ── Send email ──────────────────────────────────────────────────────
+  if (prefs.emailReminders !== false) {
+    try {
+      await sendMeetingReminderEmail({
+        to:          user.email,
+        userName:    user.fullName,
+        title:       meeting.title,
+        meetingTime: meeting.dateTime,
+        type,
+      });
+      console.log(`[Reminder] Email ${type} → ${user.email} for "${meeting.title}"`);
+      anySent = true;
+    } catch (err) {
+      console.error(`[Reminder] Email ${type} failed for meeting ${meeting._id}:`, err.message);
+    }
+  }
+
+  // ── Send push notification ──────────────────────────────────────────
+  if (prefs.pushReminders !== false) {
+    const label = _labelMap[type]?.label || 'Meeting Reminder';
+    const timeStr = meeting.dateTime
+      ? meeting.dateTime.toLocaleString('en-US', {
+          weekday: 'short', month: 'short', day: 'numeric',
+          hour: 'numeric', minute: '2-digit',
+        })
+      : '';
+    try {
+      await sendPush(
+        user._id,
+        user.fcmTokens,
+        label,
+        `"${meeting.title}"${timeStr ? ' at ' + timeStr : ''}`,
+        { meetingId: String(meeting._id), type },
+      );
+      console.log(`[Reminder] Push ${type} → ${user._id} for "${meeting.title}"`);
+      anySent = true;
+    } catch (err) {
+      console.error(`[Reminder] Push ${type} failed for meeting ${meeting._id}:`, err.message);
+    }
+  }
+
+  // ── Mark sent if at least one channel delivered ─────────────────────
+  if (anySent) {
+    try {
+      await Meeting.findByIdAndUpdate(meeting._id, {
+        [flag]: true,
+        reminderSent: true,
+      });
+    } catch (updateErr) {
+      console.error('[Reminder] Failed to update meeting flags:', updateErr.message);
+    }
     _retryQueue.delete(key);
-
-  } catch (err) {
-    console.error(`[Reminder] Failed ${type} for meeting ${meeting._id}:`, err.message);
-
-    // Enqueue for retry
-    const key = `${meeting._id}_${type}`;
+  } else {
+    // Both failed — enqueue for retry
     const entry = _retryQueue.get(key) || { meeting, user, type, attempt: 0 };
     entry.attempt += 1;
 
@@ -74,7 +115,8 @@ async function _processRetryQueue() {
     _retryQueue.delete(key);
 
     try {
-      const meeting = await Meeting.findById(entry.meetingId).lean();
+      const meetingId = entry.meeting?._id || entry.meetingId;
+      const meeting = await Meeting.findById(meetingId).lean();
       if (!meeting) continue;
       const user = await User.findById(entry.user._id || entry.user).lean();
       if (!user) continue;
