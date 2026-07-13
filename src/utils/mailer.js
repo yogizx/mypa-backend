@@ -8,11 +8,20 @@ let _transporter = null;
 function _getTransporter() {
   if (_transporter) return _transporter;
 
-  // 1) Resend HTTPS API
-  const resendKey = process.env.RESEND_API_KEY;
-  if (resendKey) {
-    console.log('[Mailer] Using Resend HTTPS API');
-    _transporter = { type: 'resend', key: resendKey };
+  // 1) Custom SMTP (Gmail, etc.) — tried first because Resend free tier blocks
+  //    sending to non-verified recipients
+  const smtpHost = process.env.SMTP_HOST;
+  if (smtpHost) {
+    _transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: Number(process.env.SMTP_PORT) || 587,
+      secure: process.env.SMTP_PORT === '465',
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    });
+    console.log(`[Mailer] Using SMTP ${smtpHost}:${process.env.SMTP_PORT || 587}`);
     return _transporter;
   }
 
@@ -29,7 +38,7 @@ function _getTransporter() {
     return _transporter;
   }
 
-  // 3) Custom SMTP (Gmail, etc.)
+  // 3) Resend HTTPS API (last resort — free tier only sends to account owner)
   const smtpHost = process.env.SMTP_HOST;
   if (smtpHost) {
     _transporter = nodemailer.createTransport({
